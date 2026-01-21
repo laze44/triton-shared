@@ -1,7 +1,9 @@
+import pathlib
 import torch
 
 import triton
 import triton.language as tl
+from triton.backends.triton_shared.driver import CPUDriver
 import benchmark
 
 # `triton.jit`'ed functions can be auto-tuned by using the `triton.autotune` decorator, which consumes:
@@ -71,8 +73,8 @@ def matmul_kernel(
     # `a_ptrs` is a block of [BLOCK_SIZE_M, BLOCK_SIZE_K] pointers
     # `b_ptrs` is a block of [BLOCK_SIZE_K, BLOCK_SIZE_N] pointers
     # See above `Pointer Arithmetics` section for details
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
@@ -86,8 +88,15 @@ def matmul_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the K dimension.
         # If it is out of bounds, set it to 0.
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        mask_k = offs_k < K - k * BLOCK_SIZE_K
+        mask_am = offs_am < M
+        mask_bn = offs_bn < N
+        mask_a = tl.broadcast_to(mask_am[:, None], (BLOCK_SIZE_M, BLOCK_SIZE_K)) & \
+            tl.broadcast_to(mask_k[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_K))
+        mask_b = tl.broadcast_to(mask_k[:, None], (BLOCK_SIZE_K, BLOCK_SIZE_N)) & \
+            tl.broadcast_to(mask_bn[None, :], (BLOCK_SIZE_K, BLOCK_SIZE_N))
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
         # We accumulate along the K dimension.
         accumulator += tl.dot(a, b)
         # Advance the ptrs to the next K block.
@@ -95,8 +104,6 @@ def matmul_kernel(
         b_ptrs += BLOCK_SIZE_K * stride_bk
     # You can fuse arbitrary activation functions here
     # while the accumulator is still in FP32!
-    if ACTIVATION == "leaky_relu":
-        accumulator = leaky_relu(accumulator)
     c = accumulator.to(tl.float32)
 
     # -----------------------------------------------------------
@@ -104,16 +111,11 @@ def matmul_kernel(
     offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    mask_cm = offs_cm < M
+    mask_cn = offs_cn < N
+    c_mask = tl.broadcast_to(mask_cm[:, None], (BLOCK_SIZE_M, BLOCK_SIZE_N)) & \
+        tl.broadcast_to(mask_cn[None, :], (BLOCK_SIZE_M, BLOCK_SIZE_N))
     tl.store(c_ptrs, c, mask=c_mask)
-
-
-
-# We can fuse `leaky_relu` by providing it as an `ACTIVATION` meta-parameter in `_matmul`.
-@triton.jit
-def leaky_relu(x):
-    x = x + 1
-    return tl.where(x >= 0, x, 0.01 * x)
 
 
 def matmul(a, b, activation=""):
@@ -144,10 +146,10 @@ def matmul(a, b, activation=""):
 
 def test_matmul(device):
     torch.manual_seed(0)
-    rows1 = 179
-    cols1 = 167
-    rows2 = 167
-    cols2 = 321
+    rows1 = 256
+    cols1 = 256
+    rows2 = 256
+    cols2 = 256
     a = torch.randn((rows1, cols1), device=device, dtype=torch.float32)
     b = torch.randn((rows2, cols2), device=device, dtype=torch.float32)
     # a = torch.full((rows1, cols1), 1, device='cpu', dtype=torch.float32)
@@ -155,6 +157,42 @@ def test_matmul(device):
     triton_output = matmul(a, b)
     torch_output = torch.matmul(a, b)
     torch.testing.assert_close(triton_output, torch_output, atol=1e-2, rtol=0)
+
+
+def dump_matmul_ttir(output_path="matmul_kernel.ttir"):
+    src = triton.compiler.ASTSource(
+        fn=matmul_kernel,
+        signature={
+            "a_ptr": "*fp32",
+            "b_ptr": "*fp32",
+            "c_ptr": "*fp32",
+            "M": "i32",
+            "N": "i32",
+            "K": "i32",
+            "stride_am": "i32",
+            "stride_ak": "i32",
+            "stride_bk": "i32",
+            "stride_bn": "i32",
+            "stride_cm": "i32",
+            "stride_cn": "i32",
+            "BLOCK_SIZE_M": "constexpr",
+            "BLOCK_SIZE_N": "constexpr",
+            "BLOCK_SIZE_K": "constexpr",
+            "GROUP_SIZE_M": "constexpr",
+            "ACTIVATION": "constexpr",
+        },
+        constexprs={
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 16,
+            "GROUP_SIZE_M": 8,
+            "ACTIVATION": "",
+        },
+    )
+    ret = triton.compile(src)
+    output_path = pathlib.Path(output_path)
+    output_path.write_text(ret.asm["ttir"])
+    print(f"TTIR 已写入: {output_path.resolve()}")
 
 
 @benchmark.measure()
@@ -168,7 +206,5 @@ def bench_matmul(M, N, K, provider):
 
 
 if __name__ == "__main__":
-    benchmark.select_cpu_backend()
-    for X in [128 * i for i in range(2, 7)]:
-        for provider in ['torch', 'triton']:
-            bench_matmul(X, X, X, provider)
+    triton.runtime.driver.set_active(CPUDriver())
+    dump_matmul_ttir()
